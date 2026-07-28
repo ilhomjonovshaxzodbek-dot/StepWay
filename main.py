@@ -5,6 +5,8 @@ import json
 import base64
 import sqlite3
 import time
+import jwt
+from jwt import PyJWKClient
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -13,12 +15,16 @@ from typing import Optional
 
 # ---------- CONFIG ----------
 # Railway'da "Variables" bo'limiga qo'shing:
-#   BOT_TOKEN   -> @BotFather bergan token
-#   SECRET_KEY  -> ixtiyoriy uzun tasodifiy matn (session imzosi uchun)
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+#   SECRET_KEY         -> ixtiyoriy uzun tasodifiy matn (bizning session imzosi uchun)
+#   TELEGRAM_CLIENT_ID -> @BotFather "Bot Settings > Web Login" da ko'rsatilgan Client ID (bot_id)
+# Eslatma: yangi Telegram OIDC tizimida BOT_TOKEN endi kerak emas.
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-me-in-railway-variables")
+TELEGRAM_CLIENT_ID = os.environ.get("TELEGRAM_CLIENT_ID", "8985400005")
+TELEGRAM_JWKS_URL = "https://oauth.telegram.org/.well-known/jwks.json"
 DB_PATH = os.environ.get("DB_PATH", "stepway.db")
 SESSION_TTL = 60 * 60 * 24 * 30  # 30 kun
+
+_jwk_client = PyJWKClient(TELEGRAM_JWKS_URL)
 
 app = FastAPI(title="StepWay API")
 
@@ -95,52 +101,46 @@ def get_current_user(authorization: Optional[str]) -> sqlite3.Row:
     return user
 
 
-# ---------- TELEGRAM LOGIN VERIFICATION ----------
-def check_telegram_auth(data: dict) -> bool:
-    if not BOT_TOKEN:
-        raise HTTPException(status_code=500, detail="Serverda BOT_TOKEN sozlanmagan")
-    received_hash = data.get("hash")
-    if not received_hash:
-        return False
-    check_fields = {k: v for k, v in data.items() if k != "hash"}
-    data_check_string = "\n".join(f"{k}={check_fields[k]}" for k in sorted(check_fields))
-    secret_key = hashlib.sha256(BOT_TOKEN.encode()).digest()
-    computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(computed_hash, received_hash):
-        return False
-    auth_date = int(data.get("auth_date", 0))
-    if time.time() - auth_date > 86400:  # 1 kundan eski login rad etiladi
-        return False
-    return True
+# ---------- TELEGRAM LOGIN VERIFICATION (yangi OIDC/JWT tizimi) ----------
+def verify_telegram_id_token(id_token: str) -> dict:
+    try:
+        signing_key = _jwk_client.get_signing_key_from_jwt(id_token)
+        claims = jwt.decode(
+            id_token,
+            signing_key.key,
+            algorithms=["RS256", "ES256", "EdDSA", "ES256K"],
+            audience=TELEGRAM_CLIENT_ID,
+            issuer="https://oauth.telegram.org",
+        )
+        return claims
+    except Exception:
+        raise HTTPException(status_code=403, detail="Telegram tasdiqlash muvaffaqiyatsiz")
 
 
 class TelegramAuthPayload(BaseModel):
-    id: int
-    first_name: Optional[str] = None
-    username: Optional[str] = None
-    photo_url: Optional[str] = None
-    auth_date: int
-    hash: str
+    id_token: str
 
 
 @app.post("/api/auth/telegram")
 def auth_telegram(payload: TelegramAuthPayload):
-    data = payload.model_dump(exclude_none=True)
-    if not check_telegram_auth(data):
-        raise HTTPException(status_code=403, detail="Telegram tasdiqlash muvaffaqiyatsiz")
+    claims = verify_telegram_id_token(payload.id_token)
+
+    telegram_id = int(claims.get("id") or claims.get("sub"))
+    first_name = claims.get("given_name") or claims.get("name")
+    username = claims.get("preferred_username")
 
     conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE telegram_id = ?", (payload.id,)).fetchone()
+    user = conn.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
     if user is None:
         conn.execute(
             "INSERT INTO users (telegram_id, first_name, username) VALUES (?, ?, ?)",
-            (payload.id, payload.first_name, payload.username),
+            (telegram_id, first_name, username),
         )
         conn.commit()
-        user = conn.execute("SELECT * FROM users WHERE telegram_id = ?", (payload.id,)).fetchone()
+        user = conn.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
     conn.close()
 
-    token = make_token(payload.id)
+    token = make_token(telegram_id)
     return {
         "token": token,
         "first_name": user["first_name"],
