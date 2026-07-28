@@ -171,6 +171,17 @@
 
   .leaflet-popup-content-wrapper, .leaflet-popup-tip{ background:var(--surface); color:var(--text); }
   .leaflet-container a.leaflet-popup-close-button{ color:var(--muted); }
+
+  .map-mode-toggle{
+    display:flex; background:var(--surface); border:1px solid var(--line); border-radius:10px;
+    overflow:hidden; box-shadow:0 4px 12px rgba(0,0,0,0.3);
+  }
+  .map-mode-toggle .mode-btn{
+    background:transparent; border:none; color:var(--muted); font-family:'Inter'; font-size:12px; font-weight:500;
+    padding:8px 12px; cursor:pointer; white-space:nowrap;
+  }
+  .map-mode-toggle .mode-btn.active{ background:var(--accent); color:#1B140A; }
+  .map-mode-toggle .mode-btn:not(.active):hover{ color:var(--text); }
 </style>
 </head>
 <body>
@@ -289,10 +300,18 @@
   function initMap(){
     if (mapReady) return;
     map = L.map('map', { zoomControl: true }).setView([41.311081, 69.240562], 13);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+
+    const streetLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       attribution: '&copy; OpenStreetMap contributors',
       maxZoom: 19
-    }).addTo(map);
+    });
+    const satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      attribution: 'Tiles &copy; Esri',
+      maxZoom: 19
+    });
+    streetLayer.addTo(map);
+    initLayerToggle(streetLayer, satelliteLayer);
+
     map.on('click', onMapClick);
     mapReady = true;
 
@@ -301,6 +320,33 @@
         map.setView([pos.coords.latitude, pos.coords.longitude], 14);
       }, () => {});
     }
+  }
+
+  function initLayerToggle(streetLayer, satelliteLayer){
+    const control = L.control({ position: 'topright' });
+    control.onAdd = function(){
+      const div = L.DomUtil.create('div', 'map-mode-toggle');
+      div.innerHTML = `
+        <button type="button" class="mode-btn active" data-mode="street">Ko'cha</button>
+        <button type="button" class="mode-btn" data-mode="sat">Sun'iy yo'ldosh</button>
+      `;
+      L.DomEvent.disableClickPropagation(div);
+      div.querySelectorAll('.mode-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          div.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+          if (btn.dataset.mode === 'sat'){
+            if (map.hasLayer(streetLayer)) map.removeLayer(streetLayer);
+            satelliteLayer.addTo(map);
+          } else {
+            if (map.hasLayer(satelliteLayer)) map.removeLayer(satelliteLayer);
+            streetLayer.addTo(map);
+          }
+        });
+      });
+      return div;
+    };
+    control.addTo(map);
   }
 
   function onMapClick(e){
@@ -412,39 +458,60 @@
 
   document.getElementById('clearBtn').addEventListener('click', resetRoute);
 
-  // ---------- TELEGRAM LOGIN WIDGET ----------
+  // ---------- TELEGRAM LOGIN (yangi OIDC tizimi) ----------
+  // @BotFather -> Bot Settings -> Web Login sahifasida ko'rsatilgan Client ID (bot_id).
+  // Bu qiymat maxfiy emas, oshkora ma'lumot.
+  const TELEGRAM_CLIENT_ID = 8985400005;
+
   function initTelegramWidget(){
     if (sessionToken) return; // allaqachon kirgan
     const holder = document.getElementById('loginWidgetHolder');
-    holder.innerHTML = '';
-    const script = document.createElement('script');
-    script.async = true;
-    script.src = 'https://telegram.org/js/telegram-widget.js?22';
-    script.setAttribute('data-telegram-login', 'stepwayloginbot'); // @stepwayloginbot
-    script.setAttribute('data-size', 'medium');
-    script.setAttribute('data-radius', '20');
-    script.setAttribute('data-onauth', 'onTelegramAuth(user)');
-    script.setAttribute('data-request-access', 'write');
-    holder.appendChild(script);
+    holder.innerHTML = '<button type="button" class="icon-btn" id="telegramLoginBtn">Telegram orqali kirish</button>';
+    document.getElementById('telegramLoginBtn').addEventListener('click', startTelegramLogin);
   }
 
-  window.onTelegramAuth = async function(user){
+  function loadTelegramLoginScript(){
+    return new Promise((resolve, reject) => {
+      if (window.Telegram && window.Telegram.Login){ resolve(); return; }
+      const script = document.createElement('script');
+      script.src = 'https://telegram.org/js/telegram-login.js';
+      script.onload = resolve;
+      script.onerror = reject;
+      document.head.appendChild(script);
+    });
+  }
+
+  async function startTelegramLogin(){
     try{
-      const res = await fetch('/api/auth/telegram', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify(user)
-      });
-      if (!res.ok) throw new Error('auth failed');
-      const data = await res.json();
-      sessionToken = data.token;
-      avgSpeed = data.avg_speed || DEFAULT_WALK_SPEED;
-      localStorage.setItem(TOKEN_KEY, sessionToken);
-      onLoggedIn();
+      await loadTelegramLoginScript();
+      window.Telegram.Login.auth(
+        { client_id: TELEGRAM_CLIENT_ID, scope: ['profile'] },
+        async function(data){
+          if (!data || !data.id_token){
+            document.getElementById('hintBox').innerHTML = 'Telegram orqali kirish bekor qilindi.';
+            return;
+          }
+          try{
+            const res = await fetch('/api/auth/telegram', {
+              method: 'POST',
+              headers: {'Content-Type':'application/json'},
+              body: JSON.stringify({ id_token: data.id_token })
+            });
+            if (!res.ok) throw new Error('auth failed');
+            const result = await res.json();
+            sessionToken = result.token;
+            avgSpeed = result.avg_speed || DEFAULT_WALK_SPEED;
+            localStorage.setItem(TOKEN_KEY, sessionToken);
+            onLoggedIn();
+          }catch(e){
+            document.getElementById('hintBox').innerHTML = 'Telegram orqali kirishda xatolik yuz berdi. Qayta urinib ko\'ring.';
+          }
+        }
+      );
     }catch(e){
-      document.getElementById('hintBox').innerHTML = 'Telegram orqali kirishda xatolik yuz berdi. Qayta urinib ko\'ring.';
+      document.getElementById('hintBox').innerHTML = 'Telegram login kutubxonasi yuklanmadi. Internetni tekshirib qayta urinib ko\'ring.';
     }
-  };
+  }
 
   async function tryRestoreSession(){
     const saved = localStorage.getItem(TOKEN_KEY);
